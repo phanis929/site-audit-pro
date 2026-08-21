@@ -1,4 +1,5 @@
 import { PageSignals } from '../src/types.js';
+import { safeFetch } from './security.js';
 
 export interface DiscoveredPage {
   url: string;
@@ -45,7 +46,7 @@ export async function checkRobotsTxt(rootUrl: URL): Promise<{ allowed: boolean; 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 3500);
 
-    const res = await fetch(robotsUrl, {
+    const res = await safeFetch(robotsUrl, {
       signal: controller.signal,
       headers: { 'User-Agent': 'SiteAuditPro-Scanner/1.0 (+https://siteaudit.pro)' },
     });
@@ -96,7 +97,7 @@ export async function extractFromSitemap(rootUrl: URL): Promise<string[]> {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 4000);
 
-      const res = await fetch(sitemapUrl, {
+      const res = await safeFetch(sitemapUrl, {
         signal: controller.signal,
         headers: { 'User-Agent': 'SiteAuditPro-Scanner/1.0 (+https://siteaudit.pro)' },
       });
@@ -170,12 +171,20 @@ export async function discoverSitePages(
 ): Promise<DiscoveredPage[]> {
   const rootUrl = normalizeUrl(inputUrl);
   const normalizedRoot = rootUrl.origin + (rootUrl.pathname.replace(/\/+$/, '') || '/');
+  const effectiveMax = Math.min(Math.max(1, maxPages), 8);
+
+  // 1. Check robots.txt first - courtesy check, applied consistently to
+  //    every candidate page below (including user-specified ones, which
+  //    previously bypassed this filter).
+  const { allowed, disallowedPaths } = await checkRobotsTxt(rootUrl);
+  const isPathAllowed = (pathname: string): boolean =>
+    !disallowedPaths.some(p => pathname.startsWith(p));
 
   const discoveredSet = new Set<string>();
   // Always include the homepage/root
   discoveredSet.add(normalizedRoot);
 
-  // 1. Add specific user-provided pages first
+  // 2. Add specific user-provided pages, filtered by robots.txt like everything else
   if (specificPages && specificPages.length > 0) {
     for (const spec of specificPages) {
       if (!spec.trim()) continue;
@@ -188,7 +197,7 @@ export async function discoverSitePages(
           fullUrl = new URL(cleanPath, rootUrl.origin).toString();
         }
         const parsed = new URL(fullUrl);
-        if (parsed.hostname === rootUrl.hostname) {
+        if (parsed.hostname === rootUrl.hostname && isPathAllowed(parsed.pathname)) {
           discoveredSet.add(parsed.origin + (parsed.pathname.replace(/\/+$/, '') || '/'));
         }
       } catch {
@@ -197,8 +206,16 @@ export async function discoverSitePages(
     }
   }
 
-  // 2. Check robots.txt (courtesy check)
-  const { disallowedPaths } = await checkRobotsTxt(rootUrl);
+  // If robots.txt disallows the whole site ("Disallow: /"), stop here -
+  // only the root and any explicitly-requested, individually-allowed
+  // pages (already filtered above) are analyzed. We don't crawl further.
+  if (!allowed) {
+    const limited = Array.from(discoveredSet).slice(0, effectiveMax);
+    return limited.map(urlStr => {
+      const parsed = new URL(urlStr);
+      return { url: urlStr, path: parsed.pathname || '/', isPrioritized: true };
+    });
+  }
 
   // 3. Try Sitemap extraction
   let candidateUrls: string[] = [];
@@ -213,7 +230,7 @@ export async function discoverSitePages(
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 6000);
-      const res = await fetch(rootUrl.toString(), {
+      const res = await safeFetch(rootUrl.toString(), {
         signal: controller.signal,
         headers: { 'User-Agent': 'SiteAuditPro-Scanner/1.0 (+https://siteaudit.pro)' },
       });
@@ -233,8 +250,7 @@ export async function discoverSitePages(
   for (const urlStr of candidateUrls) {
     try {
       const parsed = new URL(urlStr);
-      const isDisallowed = disallowedPaths.some(p => parsed.pathname.startsWith(p));
-      if (!isDisallowed) {
+      if (isPathAllowed(parsed.pathname)) {
         discoveredSet.add(parsed.origin + (parsed.pathname.replace(/\/+$/, '') || '/'));
       }
     } catch {
@@ -278,7 +294,6 @@ export async function discoverSitePages(
   prioritized.sort((a, b) => b.score - a.score);
 
   // Take top maxPages (capped at 8)
-  const effectiveMax = Math.min(Math.max(1, maxPages), 8);
   const selected = prioritized.slice(0, effectiveMax);
 
   return selected.map(item => ({
@@ -301,7 +316,7 @@ export async function gatherPageSignals(pageUrl: string): Promise<{ signals: Pag
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 8000);
 
-    const res = await fetch(pageUrl, {
+    const res = await safeFetch(pageUrl, {
       signal: controller.signal,
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 SiteAuditPro/1.0',

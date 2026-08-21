@@ -1,8 +1,10 @@
 import express, { Request, Response } from 'express';
 import path from 'path';
+import rateLimit from 'express-rate-limit';
 import { createServer as createViteServer } from 'vite';
 import { discoverSitePages, gatherPageSignals, captureScreenshot, normalizeUrl } from './server/scanner.js';
 import { auditSinglePage, identifySiteWidePatterns } from './server/geminiAuditor.js';
+import { assertPublicHost } from './server/security.js';
 import { AuditReport, AuditRequestPayload, PageAudit, ProgressUpdate } from './src/types.js';
 
 // Cache for recent audits (1 hour TTL)
@@ -22,18 +24,55 @@ async function startServer() {
 
   app.use(express.json({ limit: '10mb' }));
 
+  // Rate limiting: /api/audit triggers real money (Gemini + Microlink calls
+  // for up to 8 pages), so it gets a tight per-IP cap. The image proxy is
+  // called once per screenshot per report, so it needs more headroom but
+  // still shouldn't be unbounded.
+  const auditLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 5,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many audit requests from this IP. Please wait a few minutes and try again.' },
+  });
+
+  const proxyLimiter = rateLimit({
+    windowMs: 60 * 1000, // 1 minute
+    max: 60,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: 'Too many image proxy requests. Please slow down.',
+  });
+
   // Health check
   app.get('/api/health', (_req: Request, res: Response) => {
     res.json({ status: 'ok', time: new Date().toISOString() });
   });
 
-  // Image proxy endpoint for secure screenshot rendering / jspdf / html2canvas CORS
-  app.get('/api/proxy-image', async (req: Request, res: Response) => {
+  // Image proxy endpoint for secure screenshot rendering / jspdf / html2canvas CORS.
+  // Locked to api.microlink.io only - this exists to work around CORS for our
+  // own screenshot images, not as a general-purpose proxy. Without this
+  // restriction, this endpoint would let anyone fetch arbitrary URLs
+  // (including internal/private addresses) through our server.
+  app.get('/api/proxy-image', proxyLimiter, async (req: Request, res: Response) => {
     const targetUrl = req.query.url as string;
     if (!targetUrl) {
       res.status(400).send('Missing url parameter');
       return;
     }
+
+    let parsedTarget: URL;
+    try {
+      parsedTarget = new URL(targetUrl);
+    } catch {
+      res.status(400).send('Invalid url parameter');
+      return;
+    }
+    if (parsedTarget.protocol !== 'https:' || parsedTarget.hostname !== 'api.microlink.io') {
+      res.status(403).send('Forbidden: this proxy only serves api.microlink.io screenshot requests.');
+      return;
+    }
+
     try {
       const response = await fetch(targetUrl, {
         headers: { 'User-Agent': 'Mozilla/5.0 SiteAuditPro/1.0' },
@@ -93,7 +132,7 @@ async function startServer() {
   });
 
   // Initiate Audit API
-  app.post('/api/audit', async (req: Request, res: Response) => {
+  app.post('/api/audit', auditLimiter, async (req: Request, res: Response) => {
     const body: AuditRequestPayload = req.body;
     if (!body || !body.url) {
       res.status(400).json({ error: 'A valid website URL is required.' });
@@ -105,6 +144,14 @@ async function startServer() {
       parsedUrl = normalizeUrl(body.url);
     } catch {
       res.status(400).json({ error: 'Invalid URL format. Please provide a full valid URL (e.g. example.com).' });
+      return;
+    }
+
+    // Reject internal/private targets up front, before starting the pipeline.
+    try {
+      await assertPublicHost(parsedUrl.toString());
+    } catch {
+      res.status(400).json({ error: 'This URL cannot be audited. Please provide a public website address.' });
       return;
     }
 
