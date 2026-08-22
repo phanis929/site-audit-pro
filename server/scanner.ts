@@ -114,7 +114,12 @@ export async function extractFromSitemap(rootUrl: URL): Promise<string[]> {
           try {
             const parsed = new URL(rawUrl);
             if (parsed.hostname === rootUrl.hostname) {
-              urls.push(parsed.origin + parsed.pathname);
+              const cleanPath = parsed.pathname.replace(/\/+$/, '') || '/';
+              // Skip language-variant paths, same reasoning as the homepage
+              // link scraper below - a sitemap listing /en, /af, /ar, etc.
+              // is listing translations of the same page, not distinct content.
+              if (cleanPath !== '/' && LOCALE_CODE_PATTERN.test(cleanPath)) continue;
+              urls.push(parsed.origin + cleanPath);
             }
           } catch {
             // ignore malformed
@@ -132,8 +137,33 @@ export async function extractFromSitemap(rootUrl: URL): Promise<string[]> {
 /**
  * Extracts internal links from HTML source
  */
+// Common ISO 639-1 / locale-style single-segment path codes. Sites frequently
+// expose these as a language switcher (e.g. /en, /af, /ar, /bg, /bn) - these
+// are language variants of the SAME page, not distinct content, and should
+// not be treated as separate "key pages" to audit.
+const LOCALE_CODE_PATTERN = /^\/([a-z]{2})(-[a-z]{2})?\/?$/i;
+
+/**
+ * Extracts hreflang alternate URLs from <head> - the standards-based way
+ * sites mark language/region variants of the current page. Used to exclude
+ * these from page discovery.
+ */
+function extractHreflangUrls(html: string): Set<string> {
+  const hreflangUrls = new Set<string>();
+  const linkRegex = /<link\s+[^>]*rel=["']alternate["'][^>]*>/gi;
+  let match;
+  while ((match = linkRegex.exec(html)) !== null) {
+    const tag = match[0];
+    if (!/hreflang=/i.test(tag)) continue;
+    const hrefMatch = /href=["']([^"']+)["']/i.exec(tag);
+    if (hrefMatch) hreflangUrls.add(hrefMatch[1].trim());
+  }
+  return hreflangUrls;
+}
+
 export function extractInternalLinksFromHtml(html: string, baseUrl: URL): string[] {
   const foundUrls = new Set<string>();
+  const hreflangUrls = extractHreflangUrls(html);
   const linkRegex = /<a\s+(?:[^>]*?\s+)?href=["']([^"']+)["']/gi;
   let match;
 
@@ -142,6 +172,8 @@ export function extractInternalLinksFromHtml(html: string, baseUrl: URL): string
     if (!rawHref || rawHref.startsWith('#') || rawHref.startsWith('mailto:') || rawHref.startsWith('tel:') || rawHref.startsWith('javascript:')) {
       continue;
     }
+    // Skip anything explicitly marked as a language/region alternate of this page
+    if (hreflangUrls.has(rawHref)) continue;
 
     try {
       const resolved = new URL(rawHref, baseUrl);
@@ -150,6 +182,10 @@ export function extractInternalLinksFromHtml(html: string, baseUrl: URL): string
         // Exclude common non-HTML files
         if (!/\.(pdf|zip|tar|gz|exe|dmg|iso|mp3|mp4|wav|avi|jpg|jpeg|png|gif|svg|webp|css|js|json|xml)$/i.test(resolved.pathname)) {
           const cleanPath = resolved.pathname.replace(/\/+$/, '') || '/';
+          // Skip single-segment locale-code-shaped paths (e.g. /af, /ar,
+          // /zh-cn) - almost always a language switcher, not real content.
+          // The root path itself is exempt from this check.
+          if (cleanPath !== '/' && LOCALE_CODE_PATTERN.test(cleanPath)) continue;
           foundUrls.add(baseUrl.origin + cleanPath);
         }
       }

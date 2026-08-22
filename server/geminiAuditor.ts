@@ -89,10 +89,6 @@ Audit this specific page thoroughly across UI/UX, Content, Accessibility, and Pe
         responseSchema: {
           type: Type.OBJECT,
           properties: {
-            score: {
-              type: Type.INTEGER,
-              description: 'Overall page score from 0 to 100 based on the 4 categories',
-            },
             categories: {
               type: Type.OBJECT,
               properties: {
@@ -180,37 +176,55 @@ Audit this specific page thoroughly across UI/UX, Content, Accessibility, and Pe
               required: ['ui_ux', 'content', 'accessibility', 'performance'],
             },
           },
-          required: ['score', 'categories'],
+          required: ['categories'],
         },
       },
     });
 
     const parsedJson = JSON.parse(response.text || '{}');
 
+    const categories = {
+      ui_ux: parsedJson.categories?.ui_ux || createFallbackCategory(70),
+      content: parsedJson.categories?.content || createFallbackCategory(75),
+      accessibility: parsedJson.categories?.accessibility || createFallbackCategory(65),
+      performance: parsedJson.categories?.performance || createFallbackCategory(80),
+    };
+
+    // Page score is derived deterministically from the 4 category scores,
+    // not requested as a separate free-floating field from the model. LLMs
+    // are not reliably consistent at keeping a summary number aligned with
+    // structured detail generated in the same response - computing it in
+    // code guarantees the displayed page score always matches the category
+    // breakdown shown right below it.
+    const computedScore = Math.round(
+      (categories.ui_ux.score + categories.content.score + categories.accessibility.score + categories.performance.score) / 4
+    );
+
     return {
       url,
       path,
-      score: parsedJson.score || 70,
+      score: computedScore,
       screenshot_url: screenshotUrl,
       signals,
-      categories: {
-        ui_ux: parsedJson.categories?.ui_ux || createFallbackCategory(70),
-        content: parsedJson.categories?.content || createFallbackCategory(75),
-        accessibility: parsedJson.categories?.accessibility || createFallbackCategory(65),
-        performance: parsedJson.categories?.performance || createFallbackCategory(80),
-      },
+      categories,
     };
   } catch (err: any) {
     console.error(`Error auditing page ${url}:`, err);
-    // Graceful fallback for single page failure
+    // Graceful fallback for single page failure - score is still computed
+    // from the rule-based categories actually returned, not hardcoded,
+    // so it can't drift from what's displayed below it.
+    const fallbackCategories = generateRuleBasedCategories(signals);
+    const fallbackScore = Math.round(
+      (fallbackCategories.ui_ux.score + fallbackCategories.content.score + fallbackCategories.accessibility.score + fallbackCategories.performance.score) / 4
+    );
     return {
       url,
       path,
-      score: 65,
+      score: fallbackScore,
       screenshot_url: screenshotUrl,
       signals,
       error: `AI analysis note: ${err?.message || 'Generated from direct signal analysis'}`,
-      categories: generateRuleBasedCategories(signals),
+      categories: fallbackCategories,
     };
   }
 }
